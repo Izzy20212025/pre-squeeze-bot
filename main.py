@@ -1,13 +1,31 @@
 from __future__ import annotations
-import time
+
+import argparse
+import asyncio
+import csv
+import gzip
+import hashlib
+import json
+import math
 import os
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
 from dotenv import load_dotenv
 
+# -------------------------
+# Load .env ONLY if present (Local), otherwise GitHub Secrets env vars will work
+# -------------------------
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 if ENV_PATH.exists():
     load_dotenv(dotenv_path=ENV_PATH, override=True)
-
 
 
 def verify_env_loaded() -> None:
@@ -24,6 +42,8 @@ def verify_env_loaded() -> None:
         "EDGAR_USER_AGENT",
         "OUT_DIR",
         "CACHE_DB",
+        # NEW:
+        "DISCORD_WEBHOOK_URL",
     ]
 
     print("\n==== .ENV LOAD VERIFICATION ====")
@@ -34,25 +54,6 @@ def verify_env_loaded() -> None:
         else:
             print(f"{k:35} ✅ LOADED")
     print("================================\n")
-
-
-import argparse
-import asyncio
-import csv
-import gzip
-import hashlib
-import json
-import math
-import os
-import re
-import sqlite3
-import sys
-import time
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
-import aiohttp
 
 
 # -------------------------
@@ -96,7 +97,6 @@ def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 def percentile_rank(value: float, lo: float, hi: float) -> float:
-    """Calculate percentile rank with improved handling"""
     if math.isnan(value):
         return 0.0
     if hi <= lo:
@@ -104,7 +104,6 @@ def percentile_rank(value: float, lo: float, hi: float) -> float:
     return clamp((value - lo) / (hi - lo), 0.0, 1.0)
 
 def to_json_safe(obj: Any) -> Any:
-    """Recursively convert NaN/Inf to None so json is valid and portable."""
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -114,6 +113,27 @@ def to_json_safe(obj: Any) -> Any:
     if isinstance(obj, list):
         return [to_json_safe(v) for v in obj]
     return obj
+
+
+# -------------------------
+# Discord helper (NEW)
+# -------------------------
+
+async def discord_send(webhook_url: str, content: str) -> None:
+    """
+    Send a message to Discord via webhook.
+    Keeps message <= 1900 chars to avoid Discord limit issues.
+    """
+    if not webhook_url or not webhook_url.strip():
+        return
+    payload = {"content": content[:1900]}
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.post(webhook_url.strip(), json=payload) as r:
+                await r.text()
+    except Exception:
+        pass
 
 
 # -------------------------
@@ -139,7 +159,6 @@ class Cfg:
     uw_concurrency: int
     cache_db: str
 
-    # IMPROVED: Adjusted universe filters based on research
     min_price: float = 0.5
     max_price: float = 25.0
     min_vol: float = 300_000.0
@@ -147,7 +166,6 @@ class Cfg:
     universe_limit: int = 2500
     top_n: int = 20
 
-    # UW plan safe limits
     uw_rpm: int = int(os.getenv("UW_RPM", "60"))
     uw_max_retries: int = 5
 
@@ -341,7 +359,12 @@ class Polygon:
 
     async def grouped_daily(self, asof: str) -> List[Dict[str, Any]]:
         url = f"{self.base}/v2/aggs/grouped/locale/us/market/stocks/{asof}"
-        j = await self.http.get_json(url, params={"adjusted": "true", "apiKey": self.key}, ttl=6 * 3600, prefix="POLY_GROUPED")
+        j = await self.http.get_json(
+            url,
+            params={"adjusted": "true", "apiKey": self.key},
+            ttl=6 * 3600,
+            prefix="POLY_GROUPED",
+        )
         return j.get("results", []) or []
 
     async def daily_agg(self, ticker: str, start: str, end: str) -> List[Dict[str, Any]]:
@@ -361,10 +384,8 @@ class Polygon:
 
 
 def is_excluded_asset(details: Dict[str, Any]) -> Tuple[bool, str]:
-    """Exclude ETFs/ETNs/funds and other non-common-equity instruments"""
     t = (details.get("type") or "").upper()
     name = (details.get("name") or "").upper()
-
     if t in {"ETF", "ETN", "FUND", "MUTUALFUND", "INDEX", "CRYPTO", "FX"}:
         return True, f"type={t}"
     if "ETF" in name or "TRUST" in name or "ETN" in name:
@@ -373,7 +394,7 @@ def is_excluded_asset(details: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 # -------------------------
-# Unusual Whales (with retry/backoff + fallback endpoints)
+# Unusual Whales
 # -------------------------
 
 class UnusualWhales:
@@ -482,11 +503,7 @@ def parse_uw_borrow(j: Dict[str, Any]) -> Dict[str, Any]:
         fee = safe_float(rec.get("borrow_fee")) or safe_float(rec.get("borrow_fee_apr"))
     if math.isnan(avail):
         avail = safe_float(rec.get("shares_available"))
-    return {
-        "fee_rate": fee,
-        "shares_available": avail,
-        "asof": rec.get("market_date") or rec.get("date"),
-    }
+    return {"fee_rate": fee, "shares_available": avail, "asof": rec.get("market_date") or rec.get("date")}
 
 
 # -------------------------
@@ -494,7 +511,6 @@ def parse_uw_borrow(j: Dict[str, Any]) -> Dict[str, Any]:
 # -------------------------
 
 async def finra_shortvol_ratio(http: Http, base_url: str, asof: str, ticker: str) -> float:
-    """FINRA RegSHO daily short volume ratio"""
     ymd = asof.replace("-", "")
     candidates = [
         f"{base_url.rstrip('/')}/CNMSshvol{ymd}.txt",
@@ -543,7 +559,6 @@ async def finra_shortvol_ratio(http: Http, base_url: str, asof: str, ticker: str
 # -------------------------
 
 async def sec_get_ticker_to_cik(http: Http, user_agent: str) -> Dict[str, str]:
-    """Fetch SEC ticker-to-CIK mapping"""
     url = "https://www.sec.gov/files/company_tickers.json"
     headers = {"User-Agent": user_agent}
     try:
@@ -559,7 +574,6 @@ async def sec_get_ticker_to_cik(http: Http, user_agent: str) -> Dict[str, str]:
         return {}
 
 async def sec_recent_filings_risk(http: Http, user_agent: str, cik10: str) -> Dict[str, Any]:
-    """Check recent SEC filings for dilution risk"""
     url = f"https://data.sec.gov/submissions/CIK{cik10}.json"
     headers = {"User-Agent": user_agent}
     try:
@@ -567,12 +581,12 @@ async def sec_recent_filings_risk(http: Http, user_agent: str, cik10: str) -> Di
         recent = j.get("filings", {}).get("recent", {})
         forms = recent.get("form", [])
         dates = recent.get("filingDate", [])
-        
+
         risk = 0.0
         flags = []
         cutoff = (date.today() - timedelta(days=90)).isoformat()
-        
-        for i, (form, dt) in enumerate(zip(forms[:50], dates[:50])):
+
+        for form, dt in zip(forms[:50], dates[:50]):
             if dt < cutoff:
                 continue
             form_upper = form.upper()
@@ -584,7 +598,7 @@ async def sec_recent_filings_risk(http: Http, user_agent: str, cik10: str) -> Di
                 flags.append(f"{form}({dt})")
             elif form_upper in ("8-K", "8-K/A"):
                 risk += 3.0
-        
+
         return {"risk": min(risk, 50.0), "flags": flags[:5]}
     except Exception:
         return {"risk": 0.0, "flags": []}
@@ -632,20 +646,13 @@ class Groq:
                 dt = datetime.fromtimestamp(int(dt), tz=timezone.utc).strftime("%Y-%m-%d")
             items.append({"title": title[:180], "source": src[:40], "date": str(dt)[:10]})
 
-        # IMPROVED: Enhanced prompt for better catalyst detection
         prompt = f"""
 Analyze news for {ticker.upper()} and return STRICT JSON only with these fields:
-- sentiment: float from -1 (very negative) to 1 (very positive)
-- catalyst_strength: float from 0 to 10 (0=no catalyst, 10=major catalyst)
-- is_real_catalyst: boolean (true if there's a concrete near-term catalyst)
-- risk_flags: array of strings (e.g., ["dilution", "insider_selling", "regulatory"])
+- sentiment: float from -1 to 1
+- catalyst_strength: float from 0 to 10
+- is_real_catalyst: boolean
+- risk_flags: array of strings
 - summary: string max 240 chars
-
-Focus on identifying REAL catalysts that could drive sustained buying pressure:
-- Earnings beats, revenue growth, new contracts
-- Product launches, FDA approvals, partnerships
-- Analyst upgrades, institutional buying
-- Merger/acquisition rumors
 
 Penalize: dilution, offerings, insider selling, lawsuits, regulatory issues
 
@@ -728,12 +735,35 @@ async def build_universe(poly: Polygon, asof: str, cfg: Cfg) -> List[Dict[str, A
 
 
 # -------------------------
-# IMPROVED: Enhanced price/volume features with RSI
+# Price/volume features + RSI
 # -------------------------
+
+def calculate_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+    if len(gains) < period:
+        return 50.0
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 
 async def price_volume_features(poly: Polygon, ticker: str, asof: str) -> Dict[str, Any]:
     end = date.fromisoformat(asof)
-    start = end - timedelta(days=60)  # Extended lookback for better RSI
+    start = end - timedelta(days=60)
     bars = await poly.daily_agg(ticker, iso_date(start), iso_date(end))
     if not bars:
         return {}
@@ -750,14 +780,11 @@ async def price_volume_features(poly: Polygon, ticker: str, asof: str) -> Dict[s
     v0 = vols[-1] if vols else float("nan")
     avg20 = sum(vols[-20:]) / max(1, len(vols[-20:]))
     vol_spike = (v0 / avg20) if avg20 and not math.isnan(v0) else float("nan")
-    range_pct = ((highs[-1] - lows[-1]) / c0) * 100 if c0 else float("nan")
 
-    # Breakout detection
     prev20 = closes[-21:-1] if len(closes) >= 21 else closes[:-1]
     prior_high = max(prev20) if prev20 else float("nan")
     breakout = 1.0 if (not math.isnan(prior_high) and c0 > prior_high) else 0.0
 
-    # Trend slope
     last10 = closes[-10:]
     x = list(range(len(last10)))
     x_mean = sum(x) / len(x)
@@ -767,13 +794,12 @@ async def price_volume_features(poly: Polygon, ticker: str, asof: str) -> Dict[s
     slope = num / den
     slope_pct = (slope / c0) * 100 if c0 else 0.0
 
-    # IMPROVED: Calculate RSI (14-period)
     rsi = calculate_rsi(closes, period=14)
-
-    # IMPROVED: Calculate moving average crossover
     ma_20 = sum(closes[-20:]) / len(closes[-20:]) if len(closes) >= 20 else c0
     ma_50 = sum(closes[-50:]) / len(closes[-50:]) if len(closes) >= 50 else c0
     ma_cross = 1.0 if c0 > ma_20 and ma_20 > ma_50 else 0.0
+
+    range_pct = ((highs[-1] - lows[-1]) / c0) * 100 if c0 else float("nan")
 
     return {
         "price": c0,
@@ -790,52 +816,11 @@ async def price_volume_features(poly: Polygon, ticker: str, asof: str) -> Dict[s
     }
 
 
-def calculate_rsi(closes: List[float], period: int = 14) -> float:
-    """Calculate Relative Strength Index"""
-    if len(closes) < period + 1:
-        return 50.0  # Neutral default
-    
-    gains = []
-    losses = []
-    
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-    
-    if len(gains) < period:
-        return 50.0
-    
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    
-    if avg_loss == 0:
-        return 100.0
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
 # -------------------------
-# IMPROVED: Enhanced scoring with better thresholds
+# Scoring
 # -------------------------
 
 def presqueeze_score(feat: Dict[str, Any]) -> Tuple[float, Dict[str, float], str]:
-    """
-    IMPROVED scoring based on research findings:
-    - Adjusted thresholds (DTC 8-10, SI >20%, Fee >50%)
-    - Added RSI and MA crossover signals
-    - Enhanced catalyst weighting
-    - Better bucket classification
-    
-    Returns (score 0..100, score_parts, bucket)
-    """
-
     si = safe_float(feat.get("uw_si_float"))
     dtc = safe_float(feat.get("uw_dtc"))
     fee = safe_float(feat.get("uw_fee_rate"))
@@ -845,84 +830,59 @@ def presqueeze_score(feat: Dict[str, Any]) -> Tuple[float, Dict[str, float], str
     has_uw_short = (not math.isnan(si)) and (not math.isnan(dtc))
     has_borrow = (not math.isnan(fee)) or (not math.isnan(avail))
 
-    # Price ignition signals
     vol_spike = safe_float(feat.get("vol_spike"))
     breakout = safe_float(feat.get("breakout"))
     trend = safe_float(feat.get("trend_slope_pct"))
     rsi = safe_float(feat.get("rsi"))
     ma_cross = safe_float(feat.get("ma_cross"))
 
-    # News catalyst
     cat = safe_float(feat.get("news_catalyst_strength"))
     sent = safe_float(feat.get("news_sentiment"))
     is_real_catalyst = feat.get("news_is_real_catalyst", False)
 
-    # Options activity (gamma squeeze potential)
     options_premium = safe_float(feat.get("uw_flow_premium"))
-
-    # Dilution penalty
     edgar = safe_float(feat.get("edgar_risk"))
 
-    # A) SHORT CROWDING (0-30) - IMPROVED thresholds
-    # Research shows SI >20% and DTC 8-10 are optimal
-    a_si = percentile_rank(si, 20, 50) * 18  # Raised minimum from 10 to 20
-    a_dtc = percentile_rank(dtc, 8, 12) * 12  # Adjusted range from 2-10 to 8-12
+    a_si = percentile_rank(si, 20, 50) * 18
+    a_dtc = percentile_rank(dtc, 8, 12) * 12
     A = a_si + a_dtc
 
-    # B) BORROW STRESS (0-25) - IMPROVED thresholds
-    # Research shows fee >50% is strong signal
-    b_fee = percentile_rank(fee, 50, 200) * 16  # Raised minimum from 10 to 50
+    b_fee = percentile_rank(fee, 50, 200) * 16
     b_avail = (1.0 - percentile_rank(avail, 0, 1_000_000)) * 9 if not math.isnan(avail) else 0.0
     B = b_fee + b_avail
 
-    # C) PRICE/VOLUME IGNITION (0-30) - IMPROVED with RSI and MA
-    c_vol = percentile_rank(vol_spike, 2.0, 10.0) * 10  # Raised minimum from 1.0 to 2.0
+    c_vol = percentile_rank(vol_spike, 2.0, 10.0) * 10
     c_brk = clamp(breakout, 0, 1) * 5
     c_trend = percentile_rank(trend, -0.2, 1.0) * 5
-    # NEW: RSI oversold bonus (RSI <30 suggests potential reversal)
     c_rsi = (1.0 - percentile_rank(rsi, 20, 50)) * 5 if not math.isnan(rsi) else 0.0
-    # NEW: MA crossover signal
     c_ma = clamp(ma_cross, 0, 1) * 5
     C = c_vol + c_brk + c_trend + c_rsi + c_ma
 
-    # D) CATALYST (0-20) - IMPROVED weighting
     d_cat = percentile_rank(cat, 0, 10) * 12
     d_sent = percentile_rank(sent, -0.2, 0.8) * 5
-    # NEW: Bonus for confirmed real catalyst
     d_real = 3.0 if is_real_catalyst else 0.0
     D = d_cat + d_sent + d_real
 
-    # E) OPTIONS ACTIVITY (0-10) - NEW component
     e_opts = percentile_rank(options_premium, 0, 1_000_000) * 10 if not math.isnan(options_premium) else 0.0
     E = e_opts
 
-    # F) DILUTION PENALTY (-0..-30)
     F = -percentile_rank(edgar, 5, 40) * 30
 
-    # Base score
     total = A + B + C + D + E + F
 
-    # IMPROVED: Penalties and bonuses
     missing_pen = 0.0
     if not has_uw_short:
-        missing_pen -= 25.0  # Stronger penalty
+        missing_pen -= 25.0
     if has_uw_short and not has_borrow:
         missing_pen -= 8.0
 
-    # FINRA SVR bonus (pressure confirmation)
     finra_bonus = percentile_rank(finra, 0.50, 0.75) * 8 if not math.isnan(finra) else 0.0
 
-    # IMPROVED: High SI + High DTC combo bonus
-    if not math.isnan(si) and si >= 30 and not math.isnan(dtc) and dtc >= 8:
-        combo_bonus = 5.0
-    else:
-        combo_bonus = 0.0
+    combo_bonus = 5.0 if (not math.isnan(si) and si >= 30 and not math.isnan(dtc) and dtc >= 8) else 0.0
 
     total = clamp(total + missing_pen + finra_bonus + combo_bonus, 0, 100)
 
-    # IMPROVED: Bucket classification with stricter criteria
     if has_uw_short and has_borrow and si >= 20:
-        # High confidence: has all data and SI >20%
         if dtc >= 8 and (fee >= 50 or finra >= 0.55):
             bucket = "HIGH_CONVICTION"
         else:
@@ -954,9 +914,9 @@ async def build_row(
     ticker: str,
     asof: str,
     poly: Polygon,
-    uw: Optional[UnusualWhales],
-    finnhub: Optional[Finnhub],
-    groq: Optional[Groq],
+    uw: Optional["UnusualWhales"],
+    finnhub: Optional["Finnhub"],
+    groq: Optional["Groq"],
     http: Http,
     cfg: Cfg,
     sec_tmap: Optional[Dict[str, str]],
@@ -964,21 +924,18 @@ async def build_row(
 ) -> Optional[Dict[str, Any]]:
     out: Dict[str, Any] = {"ticker": ticker, "asof": asof}
 
-    # Exclude ETFs/funds
     try:
         details = await poly.ticker_details(ticker)
-        excluded, reason = is_excluded_asset(details)
+        excluded, _reason = is_excluded_asset(details)
         if excluded:
             return None
         out["asset_type"] = (details.get("type") or "")
     except Exception:
         out["asset_type"] = ""
 
-    # Polygon price/volume features
     pv = await price_volume_features(poly, ticker, asof)
     out.update(pv)
 
-    # UW data (rate-limited)
     if uw and cfg.uw_api_key:
         async with uw_sem:
             try:
@@ -1000,7 +957,6 @@ async def build_row(
             except Exception as e:
                 out["uw_borrow_err"] = str(e)[:200]
 
-        # IMPROVED: Options flow with better parsing
         async with uw_sem:
             try:
                 j_flow = await uw.flow_recent(ticker)
@@ -1008,24 +964,21 @@ async def build_row(
                 prem = 0.0
                 call_prem = 0.0
                 if isinstance(data, list) and data:
-                    for rec in data[:100]:  # Increased from 50 to 100
+                    for rec in data[:100]:
                         p = safe_float(rec.get("premium"), 0.0)
                         prem += p
-                        # Track call premium separately
-                        if rec.get("option_type", "").upper() == "CALL":
+                        if str(rec.get("option_type", "")).upper() == "CALL":
                             call_prem += p
                 out["uw_flow_premium"] = prem
                 out["uw_call_premium"] = call_prem
             except Exception:
                 pass
 
-    # FINRA short volume ratio
     try:
         out["finra_svr"] = await finra_shortvol_ratio(http, cfg.finra_shortvol_base, asof, ticker)
     except Exception:
         out["finra_svr"] = float("nan")
 
-    # News + Groq
     if finnhub and cfg.finnhub_api_key:
         try:
             end = date.fromisoformat(asof)
@@ -1042,7 +995,6 @@ async def build_row(
         except Exception as e:
             out["news_err"] = str(e)[:180]
 
-    # EDGAR dilution risk
     if sec_tmap and cfg.edgar_user_agent:
         cik10 = sec_tmap.get(ticker.upper())
         if cik10:
@@ -1055,7 +1007,6 @@ async def build_row(
         else:
             out["edgar_risk"] = 0.0
 
-    # Score + bucket
     total, parts, bucket = presqueeze_score(out)
     out["presqueeze_score"] = total
     out["bucket"] = bucket
@@ -1074,7 +1025,6 @@ def print_table(title: str, rows: List[Dict[str, Any]], top_n: int) -> None:
         print(f"\n{title}: (no results)\n")
         return
 
-    # IMPROVED: Added new columns
     cols = [
         "ticker", "bucket", "presqueeze_score", "price",
         "vol_spike", "rsi", "breakout", "ma_cross",
@@ -1088,7 +1038,7 @@ def print_table(title: str, rows: List[Dict[str, Any]], top_n: int) -> None:
     print("=" * 140)
     print(" | ".join([c.ljust(18) for c in cols]))
     print("-" * 140)
-    
+
     for r in rows:
         line = []
         for c in cols:
@@ -1113,8 +1063,7 @@ def print_table(title: str, rows: List[Dict[str, Any]], top_n: int) -> None:
             line.append(s)
         print(" | ".join(line))
     print("-" * 140)
-    print("IMPROVED: HIGH_CONVICTION = optimal squeeze conditions (SI>20%, DTC>8, high fee/FINRA)")
-    print("TRUE_PRE_SQUEEZE = has UW short+borrow data. WATCHLIST = partial confirmation. MOMENTUM_ONLY = not squeeze-confirmed.\n")
+    print("HIGH_CONVICTION = SI>20%, DTC>8, and high fee/FINRA confirmation.\n")
 
 
 def save_outputs(rows: List[Dict[str, Any]], out_dir: str, asof: str) -> Tuple[str, str]:
@@ -1156,19 +1105,16 @@ async def main_async(args: argparse.Namespace) -> int:
 
         asof = await resolve_asof(poly, args.asof)
 
-        # SEC mapping
-        sec_tmap = None
+        sec_tmap: Optional[Dict[str, str]]
         try:
             sec_tmap = await sec_get_ticker_to_cik(http, cfg.edgar_user_agent)
         except Exception:
             sec_tmap = None
 
-        # Universe
         universe = await build_universe(poly, asof, cfg)
         tickers = [u["ticker"] for u in universe]
         print(f"Universe size: {len(tickers)} (asof={asof})", flush=True)
 
-        # Clients
         finnhub = Finnhub(http, cfg.finnhub_api_key) if cfg.finnhub_api_key else None
         groq = Groq(session, cache, cfg.groq_api_key, cfg.groq_base_url, cfg.groq_model) if cfg.groq_api_key else None
 
@@ -1178,7 +1124,6 @@ async def main_async(args: argparse.Namespace) -> int:
             limiter = TokenBucket(cfg.uw_rpm)
             uw = UnusualWhales(http, cfg, limiter)
 
-        # Global concurrency
         sem = asyncio.Semaphore(max(1, cfg.concurrency))
 
         async def run_one(t: str) -> Optional[Dict[str, Any]]:
@@ -1190,8 +1135,6 @@ async def main_async(args: argparse.Namespace) -> int:
         rows: List[Dict[str, Any]] = []
         total = len(tasks)
         done = 0
-
-        # Progress tracking
         start_t = time.time()
 
         async def progress_heartbeat() -> None:
@@ -1207,24 +1150,19 @@ async def main_async(args: argparse.Namespace) -> int:
                 try:
                     r = await fut
                     done += 1
-
                     if done % 50 == 0 or done == total:
                         print(f"Processed {done}/{total} tickers", flush=True)
-
                     if r is not None:
                         rows.append(r)
-
                 except Exception:
                     done += 1
                     if done % 50 == 0 or done == total:
                         print(f"Processed {done}/{total} tickers", flush=True)
-
         finally:
             hb_task.cancel()
 
         rows.sort(key=lambda r: safe_float(r.get("presqueeze_score"), 0.0), reverse=True)
 
-        # IMPROVED: Split buckets with new HIGH_CONVICTION tier
         high_conv = [r for r in rows if r.get("bucket") == "HIGH_CONVICTION"]
         true_ps = [r for r in rows if r.get("bucket") == "TRUE_PRE_SQUEEZE"]
         watch = [r for r in rows if r.get("bucket") == "WATCHLIST"]
@@ -1238,6 +1176,41 @@ async def main_async(args: argparse.Namespace) -> int:
 
         json_path, csv_path = save_outputs(rows, cfg.out_dir, asof)
         print(f"\nIMPROVED VERSION - Saved:\n  {json_path}\n  {csv_path}\n", flush=True)
+
+        # -------------------------
+        # DISCORD ALERT (NEW)
+        # -------------------------
+        webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+        if webhook:
+            if high_conv:
+                top_alert = high_conv[:10]
+                lines = []
+                for r in top_alert:
+                    t = r.get("ticker", "")
+                    score = safe_float(r.get("presqueeze_score"), 0.0)
+                    price = safe_float(r.get("price"), float("nan"))
+                    si = safe_float(r.get("uw_si_float"), float("nan"))
+                    dtc = safe_float(r.get("uw_dtc"), float("nan"))
+                    fee = safe_float(r.get("uw_fee_rate"), float("nan"))
+                    finra = safe_float(r.get("finra_svr"), float("nan"))
+                    cat = safe_float(r.get("news_catalyst_strength"), 0.0)
+
+                    price_s = f"${price:.2f}" if not math.isnan(price) else "NA"
+                    si_s = f"{si:.1f}%" if not math.isnan(si) else "NA"
+                    dtc_s = f"{dtc:.1f}" if not math.isnan(dtc) else "NA"
+                    fee_s = f"{fee:.1f}%" if not math.isnan(fee) else "NA"
+                    finra_s = f"{finra:.2f}" if not math.isnan(finra) else "NA"
+
+                    lines.append(
+                        f"🚀 **{t}** — *going to explode soon*\n"
+                        f"score **{score:.1f}** | {price_s} | SI {si_s} | DTC {dtc_s} | Fee {fee_s} | FINRA {finra_s} | Cat {cat:.1f}"
+                    )
+
+                msg = f"🚨 **HIGH_CONVICTION Pre-Squeeze Alerts** (asof={asof})\n\n" + "\n\n".join(lines)
+                await discord_send(webhook, msg)
+            else:
+                await discord_send(webhook, f"🟨 No HIGH_CONVICTION tickers found today (asof={asof}).")
+
         return 0
 
 
@@ -1252,6 +1225,8 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    # optional: print env status once
+    # verify_env_loaded()
     try:
         rc = asyncio.run(main_async(args))
     except KeyboardInterrupt:
@@ -1260,5 +1235,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-
     main()
