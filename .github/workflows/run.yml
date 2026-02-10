@@ -74,12 +74,16 @@ jobs:
           if-no-files-found: warn
 
       - name: Discord notify (optional)
-        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          # Simple message (artifact is in the Actions run page)
+          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
+            echo "DISCORD_WEBHOOK_URL not set, skipping."
+            exit 0
+          fi
+
           curl -H "Content-Type: application/json" \
                -X POST \
                -d "{\"content\":\"✅ Pre-Squeeze Scanner finished. Check the GitHub Actions run artifacts for presqueeze_*.json / .csv.\"}" \
                "$DISCORD_WEBHOOK_URL"
+
