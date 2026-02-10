@@ -46,6 +46,7 @@ jobs:
           EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
           OUT_DIR: ${{ secrets.OUT_DIR }}
           CACHE_DB: ${{ secrets.CACHE_DB }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           python main.py --concurrency 8 --uw-concurrency 3 --top 20
 
