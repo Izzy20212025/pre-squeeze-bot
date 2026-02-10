@@ -4,9 +4,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# FORCE load .env from the same directory as this file
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=ENV_PATH, override=True)
+if ENV_PATH.exists():
+    load_dotenv(dotenv_path=ENV_PATH, override=True)
+
 
 
 def verify_env_loaded() -> None:
@@ -1259,4 +1260,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
     main()
