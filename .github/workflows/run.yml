@@ -3,10 +3,9 @@ name: Run Pre-Squeeze Scanner
 on:
   workflow_dispatch: {}
   schedule:
-    # 9:30 AM New York
-    # NOTE: UTC offset changes with DST
-    # Standard Time: 14:30 UTC
-    # Daylight Time: 13:30 UTC
+    # NOTE: GitHub cron is UTC.
+    # 9:30am New York = 14:30 UTC (standard time) or 13:30 UTC (daylight time)
+    # Pick one, or just use workflow_dispatch.
     - cron: "30 13 * * 1-5"
 
 jobs:
@@ -15,43 +14,56 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # 1️⃣ Pull your repo code
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2️⃣ Set up Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3️⃣ Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4️⃣ Run your scanner
       - name: Run scanner
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           UNUSUALWHALES_API_KEY: ${{ secrets.UNUSUALWHALES_API_KEY }}
+
           UW_BASE_URL: ${{ secrets.UW_BASE_URL }}
           UW_SHORT_ENDPOINT_TEMPLATE: ${{ secrets.UW_SHORT_ENDPOINT_TEMPLATE }}
           UW_BORROW_ENDPOINT_TEMPLATE: ${{ secrets.UW_BORROW_ENDPOINT_TEMPLATE }}
           UW_OPTIONS_ENDPOINT_TEMPLATE: ${{ secrets.UW_OPTIONS_ENDPOINT_TEMPLATE }}
+
           FINRA_SHORTVOL_BASE: ${{ secrets.FINRA_SHORTVOL_BASE }}
           EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
+
           OUT_DIR: ${{ secrets.OUT_DIR }}
           CACHE_DB: ${{ secrets.CACHE_DB }}
+
+          # Discord (optional)
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
+          # Fallback defaults if you didn't set some secrets
+          export UW_BASE_URL="${UW_BASE_URL:-https://api.unusualwhales.com}"
+          export UW_SHORT_ENDPOINT_TEMPLATE="${UW_SHORT_ENDPOINT_TEMPLATE:-/api/shorts/{ticker}/interest-float/v2}"
+          export UW_BORROW_ENDPOINT_TEMPLATE="${UW_BORROW_ENDPOINT_TEMPLATE:-/api/shorts/{ticker}/data/v2}"
+          export UW_OPTIONS_ENDPOINT_TEMPLATE="${UW_OPTIONS_ENDPOINT_TEMPLATE:-/api/stock/{ticker}/flow-recent}"
+          export FINRA_SHORTVOL_BASE="${FINRA_SHORTVOL_BASE:-https://cdn.finra.org/equity/regsho/daily}"
+          export EDGAR_USER_AGENT="${EDGAR_USER_AGENT:-Finance Corp financecorp@email.com}"
+          export OUT_DIR="${OUT_DIR:-out}"
+          export CACHE_DB="${CACHE_DB:-cache.sqlite}"
+
           python main.py --concurrency 8 --uw-concurrency 3 --top 20
 
-      # 5️⃣ SAVE OUTPUT FILES (IMPORTANT)
-      - name: Upload outputs
+          echo "Outputs:"
+          ls -lah "${OUT_DIR}" || true
+
+      - name: Upload outputs (Artifacts)
         uses: actions/upload-artifact@v4
         with:
           name: presqueeze-output
@@ -59,3 +71,15 @@ jobs:
             out/*.json
             out/*.csv
             cache.sqlite
+          if-no-files-found: warn
+
+      - name: Discord notify (optional)
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # Simple message (artifact is in the Actions run page)
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\":\"✅ Pre-Squeeze Scanner finished. Check the GitHub Actions run artifacts for presqueeze_*.json / .csv.\"}" \
+               "$DISCORD_WEBHOOK_URL"
